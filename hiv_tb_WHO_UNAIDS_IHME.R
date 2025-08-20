@@ -170,6 +170,12 @@ hiv_indicators <- c(
   "Incidence (per 1,000)" # UNAIDS rate (per 1,000)
 )
 
+# Optional cascade of care indicators
+#hiv_indicators <- c(hiv_indicators,
+#"Percent of PLHIV who know their status",
+#"Percent on ART of diagnosed PLHIV",
+#"Percent VLS of those on ART")
+
 hiv_unaids <- df_unaids %>%
   filter(country %in% unique(locales$unaids_name),
          indicator %in% hiv_indicators,
@@ -189,6 +195,7 @@ hiv_unaids <- df_unaids %>%
 #   with header: Authorization: <YOUR-KEY>
 
 ihme_base <- "https://api.healthdata.org/sdg/v1"
+Sys.setenv(IHME_API_KEY = "p73i8m5wxsazxpbud5s9dob04swki16j")
 ihme_key  <- Sys.getenv("IHME_API_KEY") # set this in your .Renviron for persistent use
 
 ihme_get <- function(endpoint, query = list()) {
@@ -228,18 +235,36 @@ ihme_tb_inc_id  <- find_indicator_id("tuberculosis.*incidence|TB.*incidence")
 # Map our locales to IHME location IDs
 get_loc_id <- function(name) {
   if (nrow(loc_catalog) == 0) return(NA_character_)
-  loc_catalog %>%
-    filter(grepl(paste0("^", stringr::str_replace_all(name, "[()]", "\\\\1"), "$"),
-                 location_name, ignore.case = TRUE) |
-             grepl(name, location_name, ignore.case = TRUE)) %>%
-    arrange(location_id) %>%
-    slice(1) %>%
-    pull(location_id) %>%
-    as.character()
+  
+  # Try exact name (case-insensitive), then "contains", then special-case Global
+  hits <- loc_catalog %>%
+    dplyr::filter(tolower(location_name) == tolower(name))
+  
+  if (nrow(hits) == 0) {
+    hits <- loc_catalog %>%
+      dplyr::filter(grepl(name, location_name, ignore.case = TRUE))
+  }
+  
+  if (nrow(hits) == 0 && grepl("^global$", name, ignore.case = TRUE)) {
+    hits <- loc_catalog %>%
+      dplyr::filter(grepl("^global", location_name, ignore.case = TRUE)) %>%
+      dplyr::arrange(nchar(location_name))  # prefer the shortest "Global..." label
+  }
+  
+  if (nrow(hits) == 0) return(NA_character_)
+  as.character(hits$location_id[[1]])
 }
 
+
 ihme_loc_map <- locales %>%
-  mutate(ihme_location_id = purrr::map_chr(locale, get_loc_id))
+  dplyr::rowwise() %>%
+  dplyr::mutate(ihme_location_id = get_loc_id(locale)) %>%
+  dplyr::ungroup()
+
+# (Optional) see which locales didn't match IHME
+missing <- ihme_loc_map %>% dplyr::filter(is.na(ihme_location_id))
+if (nrow(missing) > 0) message("IHME location not found for: ",
+                               paste(missing$locale, collapse = ", "))
 
 # Years: pull full time series if available; otherwise most recent
 years_to_pull <- NULL  # NULL = let API return all
@@ -351,19 +376,27 @@ write_geo_sheet <- function(geo) {
 
 # We’ll create 8 sheets explicitly for clarity:
 make_sheet <- function(title, filt_fun) {
-  df <- all_long %>% filt_fun() %>% arrange(year, indicator, source)
-  # choose indicators for HIV or TB titles
+  # Build the long data for this sheet
+  df <- filt_fun() %>% dplyr::arrange(year, indicator, source)
+  
+  # Only add [source] when an indicator appears from >1 source
+  df_w <- df %>%
+    dplyr::group_by(indicator) %>%
+    dplyr::mutate(ind_key = dplyr::if_else(dplyr::n_distinct(source) > 1,
+                                           paste0(indicator, " [", source, "]"),
+                                           as.character(indicator))) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(year, ind_key, value) %>%
+    tidyr::pivot_wider(names_from = ind_key, values_from = value) %>%
+    dplyr::arrange(year)
+  
   sheet_name <- substr(title, 1, 31)
   openxlsx::addWorksheet(wb, sheet_name)
-  df_w <- df %>%
-    mutate(ind_key = paste0(indicator,
-                            ifelse(length(unique(source[as.character(indicator) == as.character(indicator)])) > 1,
-                                   paste0(" [", source, "]"), ""))) %>%
-    select(year, ind_key, value) %>%
-    pivot_wider(names_from = ind_key, values_from = value) %>%
-    arrange(year)
   openxlsx::writeData(wb, sheet_name, df_w)
+  openxlsx::freezePane(wb, sheet_name, firstActiveRow = 2, firstActiveCol = 2)
+  openxlsx::addFilter(wb, sheet_name, row = 1, cols = 1:ncol(df_w))
 }
+
 
 make_sheet("HIV - Global",        function() filter(hiv_unaids, geography == "Global") %>% bind_rows(ihme_all %>% filter(geography=="Global" & grepl("HIV", indicator, ignore.case=TRUE))))
 make_sheet("HIV - South Africa",  function() filter(hiv_unaids, geography == "South Africa") %>% bind_rows(ihme_all %>% filter(geography=="South Africa" & grepl("HIV", indicator, ignore.case=TRUE))))
@@ -374,6 +407,22 @@ make_sheet("TB - Global",         function() filter(tb_est_long, geography == "G
 make_sheet("TB - South Africa",   function() filter(tb_est_long, geography == "South Africa") %>% bind_rows(ihme_all %>% filter(geography=="South Africa" & grepl("tuberculosis|TB", indicator, ignore.case=TRUE))))
 make_sheet("TB - Zimbabwe",       function() filter(tb_est_long, geography == "Zimbabwe") %>% bind_rows(ihme_all %>% filter(geography=="Zimbabwe" & grepl("tuberculosis|TB", indicator, ignore.case=TRUE))))
 make_sheet("TB - Malawi",         function() filter(tb_est_long, geography == "Malawi") %>% bind_rows(ihme_all %>% filter(geography=="Malawi" & grepl("tuberculosis|TB", indicator, ignore.case=TRUE))))
+
+prov <- dplyr::tibble(
+  source = c("UNAIDS", "UNAIDS", "WHO TB", "WHO TB", "IHME SDG", "IHME SDG", "Run"),
+  field  = c("asset_name", "download_url", "estimates_endpoint", "notes",
+             "indicator_id (HIV incidence)", "indicator_id (TB incidence)", "timestamp_utc"),
+  value  = c(attr(df_unaids, "unaids_asset") %||% "mindthegap::load_unaids()",
+             attr(df_unaids, "unaids_url")   %||% "piggyback (repo releases)",
+             "https://extranet.who.int/tme/generateCSV.asp?ds=estimates",
+             "WHO TB: public CSV API (burden estimates)",
+             ihme_hiv_inc_id %||% "skipped (no IHME_API_KEY)",
+             ihme_tb_inc_id  %||% "skipped (no IHME_API_KEY)",
+             format(Sys.time(), tz = "UTC"))
+)
+
+openxlsx::addWorksheet(wb, "Provenance")
+openxlsx::writeData(wb, "Provenance", prov)
 
 openxlsx::saveWorkbook(wb, out_file, overwrite = TRUE)
 
