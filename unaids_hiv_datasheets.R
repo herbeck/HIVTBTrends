@@ -22,7 +22,7 @@ dir.create(dirname(out_xlsx), recursive = TRUE, showWarnings = FALSE)
 # ---- Sheets and locations to keep
 sheet_est <- "HIV2025Estimates_ByYear"
 sheet_tt  <- "HIV-Test-&-Treat_ByYear"
-locations <- c("Global","South Africa","Zimbabwe","Malawi")
+locations <- c("Global","South Africa","Zimbabwe","Malawi","Nigeria","Kenya","Mozambique")
 
 # ---- Known layout for this workbook:
 # Two header rows at Excel rows 5 and 6 (1-based indexing).
