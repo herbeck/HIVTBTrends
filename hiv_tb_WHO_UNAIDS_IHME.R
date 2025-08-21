@@ -18,6 +18,14 @@ if (!requireNamespace("mindthegap", quietly = TRUE)) {
 }
 library(mindthegap)
 
+empty_long <- tibble::tibble(
+  source    = character(),
+  indicator = character(),
+  geography = character(),
+  year      = integer(),
+  value     = double()
+)
+
 # ---- 1) Config --------------------------------------------------------------
 locales <- tibble::tribble(
   ~locale,         ~iso3, ~who_name,      ~unaids_name,
@@ -216,6 +224,61 @@ ihme_get <- function(endpoint, query = list()) {
 ind_catalog <- tryCatch(ihme_get("GetIndicator"), error = function(e) tibble())
 loc_catalog <- tryCatch(ihme_get("GetLocation"),  error = function(e) tibble())
 
+# ---------- IHME location lookup helpers (paste ABOVE ihme_targets) ----------
+normalize_key <- function(x) tolower(gsub("[^a-z0-9]+", "", x))
+
+safe_get_loc_id <- function(name, iso3 = NA_character_) {
+  if (!exists("loc_catalog") || !is.data.frame(loc_catalog) || nrow(loc_catalog) == 0)
+    return(NA_character_)
+  
+  # 1) exact match on name
+  hits <- loc_catalog %>% dplyr::filter(tolower(location_name) == tolower(name))
+  
+  # 2) contains match
+  if (nrow(hits) == 0) {
+    hits <- loc_catalog %>% dplyr::filter(grepl(name, location_name, ignore.case = TRUE))
+  }
+  
+  # 3) special-case "Global" (SDG API normally has no Global; return NA)
+  if (nrow(hits) == 0 && grepl("^global$", name, ignore.case = TRUE)) {
+    return(NA_character_)
+  }
+  
+  # 4) try ISO3 if present in catalog
+  if (nrow(hits) == 0 && !is.na(iso3)) {
+    code_cols <- intersect(names(loc_catalog),
+                           c("location_code","iso3","iso_code3","ihme_loc_code","gbd_location_id"))
+    if (length(code_cols) > 0) {
+      cond <- Reduce(`|`, lapply(code_cols, function(cc)
+        toupper(loc_catalog[[cc]]) == toupper(iso3)))
+      idx <- which(cond %in% TRUE)
+      if (length(idx)) hits <- loc_catalog[idx, , drop = FALSE]
+    }
+  }
+  
+  # 5) normalized text equality
+  if (nrow(hits) == 0) {
+    lk <- normalize_key(name)
+    hits <- loc_catalog %>%
+      dplyr::mutate(key = normalize_key(location_name)) %>%
+      dplyr::filter(key == lk)
+  }
+  
+  if (nrow(hits) == 0) return(NA_character_)
+  as.character(hits$location_id[[1]])
+}
+
+ihme_targets <- locales %>%
+  dplyr::filter(locale != "Global") %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(ihme_location_id = safe_get_loc_id(locale, iso3)) %>%
+  dplyr::ungroup()
+
+missing <- ihme_targets %>% dplyr::filter(is.na(ihme_location_id))
+if (nrow(missing) > 0) message("IHME location not found for: ",
+                               paste(missing$locale, collapse = ", "))
+
+
 # Helper to find indicator IDs by a regex over the indicator name
 find_indicator_id <- function(pattern) {
   if (nrow(ind_catalog) == 0) return(NA_character_)
@@ -269,38 +332,76 @@ if (nrow(missing) > 0) message("IHME location not found for: ",
 # Years: pull full time series if available; otherwise most recent
 years_to_pull <- NULL  # NULL = let API return all
 
-pull_ihme_series <- function(ind_id, loc_id, years = years_to_pull) {
-  if (is.na(ind_id) || is.na(loc_id) || ind_id == "" || loc_id == "") return(tibble())
+# helper to pick first present column name
+.pick <- function(df, candidates) {
+  nm <- intersect(candidates, names(df))
+  if (length(nm)) nm[[1]] else NA_character_
+}
+
+pull_ihme_series <- function(ind_id, loc_id, years = NULL) {
+  if (is.na(ind_id) || is.na(loc_id) || !nzchar(ind_id) || !nzchar(loc_id)) {
+    return(tibble::tibble())  # nothing to do
+  }
+  
   q <- list(indicator_id = ind_id, location_id = loc_id)
   if (!is.null(years)) q$year <- paste(years, collapse = ",")
-  df <- tryCatch(ihme_get(paste0("GetResultsByIndicator?indicator_id=", ind_id,
-                                 "&location_id=", loc_id,
-                                 if (!is.null(years)) paste0("&year=", paste(years, collapse = ",")) else "")),
-                 error = function(e) tibble())
-  if (nrow(df) == 0) return(df)
-  df %>%
-    transmute(source = "IHME SDG",
-              indicator = indicator_name,
-              geography = location_name,
-              year = as.integer(year),
-              value = mean_estimate)
+  
+  df <- tryCatch(ihme_get("GetResultsByIndicator", q), error = function(e) tibble::tibble())
+  
+  # If the API returned nothing or a 0-col tibble, bail early
+  if (!is.data.frame(df) || nrow(df) == 0 || length(names(df)) == 0) {
+    return(tibble::tibble())
+  }
+  
+  # Tolerate naming differences across SDG deployments
+  yr  <- .pick(df, c("year","year_id","time"))
+  geo <- .pick(df, c("location_name","location","location_long"))
+  ind <- .pick(df, c("indicator_name","indicator"))
+  val <- .pick(df, c("mean_estimate","estimate_mean","mean","val","point_estimate"))
+  
+  # If any critical column is missing, skip
+  if (any(is.na(c(yr, geo, ind, val)))) {
+    return(tibble::tibble())
+  }
+  
+  tibble::tibble(
+    source    = "IHME SDG",
+    indicator = df[[ind]],
+    geography = df[[geo]],
+    year      = as.integer(df[[yr]]),
+    value     = as.numeric(df[[val]])
+  )
 }
+
 
 ihme_series <- list()
 
 if (!is.na(ihme_hiv_inc_id)) {
-  ihme_series[["HIV"]] <- ihme_loc_map %>%
-    mutate(dat = purrr::map(ihme_location_id, ~ pull_ihme_series(ihme_hiv_inc_id, .x))) %>%
-    pull(dat) %>% bind_rows()
+  ihme_series[["HIV"]] <- ihme_targets |>
+    dplyr::mutate(dat = purrr::map(ihme_location_id, ~ pull_ihme_series(ihme_hiv_inc_id, .x))) |>
+    dplyr::pull(dat) |>
+    dplyr::bind_rows()
 }
 
 if (!is.na(ihme_tb_inc_id)) {
-  ihme_series[["TB"]] <- ihme_loc_map %>%
-    mutate(dat = purrr::map(ihme_location_id, ~ pull_ihme_series(ihme_tb_inc_id, .x))) %>%
-    pull(dat) %>% bind_rows()
+  ihme_series[["TB"]] <- ihme_targets |>
+    dplyr::mutate(dat = purrr::map(ihme_location_id, ~ pull_ihme_series(ihme_tb_inc_id, .x))) |>
+    dplyr::pull(dat) |>
+    dplyr::bind_rows()
 }
 
-ihme_all <- bind_rows(ihme_series)
+ihme_all_raw <- if (length(ihme_series) && sum(lengths(ihme_series)) > 0) {
+  dplyr::bind_rows(ihme_series)
+} else tibble::tibble()
+
+# ensure expected columns even if empty
+empty_long <- tibble::tibble(
+  source = character(), indicator = character(), geography = character(),
+  year = integer(), value = double()
+)
+ihme_all <- dplyr::bind_rows(empty_long, ihme_all_raw) |>
+  dplyr::select(names(empty_long))
+
 
 # ---- 5) Harmonize & build per-locale sheets --------------------------------
 # Unified long format with (source, indicator, geography, year, value)
@@ -376,15 +477,25 @@ write_geo_sheet <- function(geo) {
 
 # We’ll create 8 sheets explicitly for clarity:
 make_sheet <- function(title, filt_fun) {
-  # Build the long data for this sheet
   df <- filt_fun() %>% dplyr::arrange(year, indicator, source)
   
-  # Only add [source] when an indicator appears from >1 source
+  # If nothing to write, still create a minimal sheet
+  if (nrow(df) == 0L) {
+    sheet_name <- substr(title, 1, 31)
+    openxlsx::addWorksheet(wb, sheet_name)
+    openxlsx::writeData(wb, sheet_name, tibble::tibble(year = integer()))
+    return(invisible(NULL))
+  }
+  
+  # Add [source] only when an indicator appears from >1 source
   df_w <- df %>%
     dplyr::group_by(indicator) %>%
-    dplyr::mutate(ind_key = dplyr::if_else(dplyr::n_distinct(source) > 1,
-                                           paste0(indicator, " [", source, "]"),
-                                           as.character(indicator))) %>%
+    dplyr::mutate(
+      needs_suffix = dplyr::n_distinct(source) > 1,
+      ind_key = ifelse(needs_suffix,
+                       paste0(indicator, " [", source, "]"),
+                       as.character(indicator))
+    ) %>%
     dplyr::ungroup() %>%
     dplyr::select(year, ind_key, value) %>%
     tidyr::pivot_wider(names_from = ind_key, values_from = value) %>%
@@ -396,6 +507,7 @@ make_sheet <- function(title, filt_fun) {
   openxlsx::freezePane(wb, sheet_name, firstActiveRow = 2, firstActiveCol = 2)
   openxlsx::addFilter(wb, sheet_name, row = 1, cols = 1:ncol(df_w))
 }
+
 
 
 make_sheet("HIV - Global",        function() filter(hiv_unaids, geography == "Global") %>% bind_rows(ihme_all %>% filter(geography=="Global" & grepl("HIV", indicator, ignore.case=TRUE))))
